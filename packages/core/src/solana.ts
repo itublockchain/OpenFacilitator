@@ -47,18 +47,53 @@ export const USDC_MINTS: Record<string, string> = {
   'solana-devnet': '4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU',
 };
 
+/**
+ * Solana commitment levels for transaction confirmation
+ *
+ * Solana's Shreds architecture provides streaming block production (~400ms slots),
+ * similar to Base's Flashblocks (~200ms). Each level offers different guarantees:
+ *
+ * - 'processed': Leader has processed the tx (~400ms). Fastest but fork risk exists.
+ * - 'confirmed': 66%+ stake has voted on the block (~1-2s). Optimistic confirmation.
+ *                No confirmed block has ever been reverted in Solana's history.
+ * - 'finalized': 31+ blocks built on top (~6-12s). Irreversible.
+ */
+export type SolanaCommitmentLevel = 'processed' | 'confirmed' | 'finalized';
+
+/**
+ * Callback for progressive confirmation updates
+ * Allows callers to receive intermediate status updates as the transaction
+ * progresses through confirmation levels (processed → confirmed → finalized)
+ */
+export type SolanaConfirmationCallback = (update: {
+  level: SolanaCommitmentLevel;
+  signature: string;
+  timestamp: number;
+}) => void;
+
 export interface SolanaSettlementParams {
   network: 'solana' | 'solana-devnet';
   /** Base64 or base58 encoded signed transaction from the payer */
   signedTransaction: string;
   /** Facilitator's private key (base58 encoded) - used as fee payer if needed */
   facilitatorPrivateKey: string;
+  /**
+   * Commitment level to wait for before returning success.
+   * Defaults to 'confirmed' (~1-2s, 66%+ stake voted, no historical reverts).
+   * Use 'finalized' for large amounts (~6-12s, fully irreversible).
+   * Use 'processed' for ultra-fast pre-confirmation (~400ms, fork risk).
+   */
+  commitmentLevel?: SolanaCommitmentLevel;
+  /** Optional callback for progressive confirmation updates */
+  onConfirmationProgress?: SolanaConfirmationCallback;
 }
 
 export interface SolanaSettlementResult {
   success: boolean;
   transactionHash?: string;
   errorMessage?: string;
+  /** The commitment level at which the transaction was confirmed */
+  commitmentLevel?: SolanaCommitmentLevel;
 }
 
 /**
@@ -70,12 +105,19 @@ export interface SolanaSettlementResult {
 export async function executeSolanaSettlement(
   params: SolanaSettlementParams
 ): Promise<SolanaSettlementResult> {
-  const { network, signedTransaction, facilitatorPrivateKey } = params;
+  const {
+    network,
+    signedTransaction,
+    facilitatorPrivateKey,
+    commitmentLevel = 'confirmed',
+    onConfirmationProgress,
+  } = params;
 
-  console.log('[SolanaSettlement] Starting settlement:', { 
-    network, 
+  console.log('[SolanaSettlement] Starting settlement:', {
+    network,
     txLength: signedTransaction?.length,
-    hasPrivateKey: !!facilitatorPrivateKey 
+    hasPrivateKey: !!facilitatorPrivateKey,
+    commitmentLevel,
   });
 
   const rpcUrl = getSolanaRpcUrl(network);
@@ -90,7 +132,7 @@ export async function executeSolanaSettlement(
   console.log('[SolanaSettlement] Using RPC:', rpcUrl.substring(0, 50) + '...');
 
   try {
-    const connection = new Connection(rpcUrl, 'confirmed');
+    const connection = new Connection(rpcUrl, commitmentLevel);
 
     // Decode the facilitator's keypair
     const facilitatorKeypair = Keypair.fromSecretKey(
@@ -209,17 +251,34 @@ export async function executeSolanaSettlement(
     }
 
     // Wait for transaction confirmation before returning success
-    // This ensures downstream consumers can verify the transaction on-chain
-    console.log('[SolanaSettlement] Waiting for confirmation...');
+    // Solana's Shreds architecture streams block data in real-time,
+    // providing fast pre-confirmation similar to Base's Flashblocks
+    console.log(`[SolanaSettlement] Waiting for '${commitmentLevel}' confirmation...`);
     try {
-      const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash('confirmed');
+      const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash(commitmentLevel);
+
+      // For progressive confirmation: if target is 'confirmed' or 'finalized',
+      // first check 'processed' level and notify via callback
+      if (onConfirmationProgress && commitmentLevel !== 'processed') {
+        // Fire-and-forget: check processed status in parallel
+        connection.getSignatureStatus(signature).then((status) => {
+          if (status.value?.confirmationStatus) {
+            onConfirmationProgress({
+              level: 'processed',
+              signature,
+              timestamp: Date.now(),
+            });
+          }
+        }).catch(() => { /* ignore progress check errors */ });
+      }
+
       const confirmation = await connection.confirmTransaction(
         {
           signature,
           blockhash,
           lastValidBlockHeight,
         },
-        'confirmed'
+        commitmentLevel
       );
 
       if (confirmation.value.err) {
@@ -228,13 +287,42 @@ export async function executeSolanaSettlement(
           success: false,
           transactionHash: signature,
           errorMessage: `Transaction failed: ${JSON.stringify(confirmation.value.err)}`,
+          commitmentLevel,
         };
       }
 
-      console.log('[SolanaSettlement] SUCCESS! Transaction confirmed:', signature);
+      console.log(`[SolanaSettlement] SUCCESS! Transaction ${commitmentLevel}:`, signature);
+
+      // Notify callback of the achieved confirmation level
+      if (onConfirmationProgress) {
+        onConfirmationProgress({
+          level: commitmentLevel,
+          signature,
+          timestamp: Date.now(),
+        });
+      }
+
+      // If target was 'confirmed' and we want to also track finalization in background
+      if (commitmentLevel === 'confirmed' && onConfirmationProgress) {
+        // Fire-and-forget: monitor finalization in background
+        connection.confirmTransaction(
+          { signature, blockhash, lastValidBlockHeight },
+          'finalized'
+        ).then((finalConfirmation) => {
+          if (!finalConfirmation.value.err) {
+            onConfirmationProgress({
+              level: 'finalized',
+              signature,
+              timestamp: Date.now(),
+            });
+          }
+        }).catch(() => { /* ignore background finalization check */ });
+      }
+
       return {
         success: true,
         transactionHash: signature,
+        commitmentLevel,
       };
     } catch (confirmError) {
       // If confirmation times out but tx was sent, still return success
@@ -246,10 +334,12 @@ export async function executeSolanaSettlement(
       try {
         const status = await connection.getSignatureStatus(signature);
         if (status.value?.confirmationStatus === 'confirmed' || status.value?.confirmationStatus === 'finalized') {
-          console.log('[SolanaSettlement] Transaction confirmed on retry check:', signature);
+          const achievedLevel = status.value.confirmationStatus as SolanaCommitmentLevel;
+          console.log(`[SolanaSettlement] Transaction ${achievedLevel} on retry check:`, signature);
           return {
             success: true,
             transactionHash: signature,
+            commitmentLevel: achievedLevel,
           };
         }
       } catch {
@@ -261,6 +351,7 @@ export async function executeSolanaSettlement(
         success: false,
         transactionHash: signature,
         errorMessage: `Transaction sent but confirmation failed: ${confirmError instanceof Error ? confirmError.message : 'Timeout'}`,
+        commitmentLevel,
       };
     }
   } catch (error) {

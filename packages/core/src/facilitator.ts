@@ -22,7 +22,7 @@ import {
 } from './types.js';
 import { getChainIdFromNetwork, getNetworkFromChainId, getCaip2FromNetwork, defaultChains, isStacksChain } from './chains.js';
 import { executeERC3009Settlement } from './erc3009.js';
-import { executeSolanaSettlement } from './solana.js';
+import { executeSolanaSettlement, type SolanaCommitmentLevel } from './solana.js';
 import { executeStacksSettlement } from './stacks.js';
 
 /**
@@ -401,11 +401,24 @@ export class Facilitator {
           };
         }
 
+        // Determine commitment level based on payment amount
+        // For micropayments (< $100 USDC = 100_000_000 base units): use 'confirmed' (~1-2s)
+        // For larger amounts: use 'finalized' (~6-12s, fully irreversible)
+        // Solana's Shreds architecture provides streaming pre-confirmation,
+        // similar to Base's Flashblocks but backed by validator supermajority
+        const paymentAmount = BigInt(getRequiredAmount(requirements));
+        const FINALIZED_THRESHOLD = BigInt(100_000_000); // $100 USDC (6 decimals)
+        const solanaCommitment: SolanaCommitmentLevel =
+          paymentAmount >= FINALIZED_THRESHOLD ? 'finalized' : 'confirmed';
+
+        console.log(`[Facilitator] Solana commitment: ${solanaCommitment} (amount: ${paymentAmount})`);
+
         // For Solana, private key is base58 encoded (not hex)
         const result = await executeSolanaSettlement({
           network: chainId as 'solana' | 'solana-devnet',
           signedTransaction,
           facilitatorPrivateKey: privateKey,
+          commitmentLevel: solanaCommitment,
         });
 
         if (result.success) {
