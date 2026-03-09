@@ -36,7 +36,7 @@ function getSolanaRpcUrl(network: string): string {
   if (network === 'solana-devnet') {
     return process.env.SOLANA_DEVNET_RPC_URL || 'https://api.devnet.solana.com';
   }
-  return 'https://api.mainnet-beta.solana.com';
+  return process.env.SOLANA_RPC_URL || 'https://api.mainnet-beta.solana.com';
 }
 
 /**
@@ -84,6 +84,14 @@ export interface SolanaSettlementParams {
    * Use 'processed' for ultra-fast pre-confirmation (~400ms, fork risk).
    */
   commitmentLevel?: SolanaCommitmentLevel;
+  /**
+   * Skip confirmation entirely and return immediately after sendTransaction.
+   * The leader accepting the tx (returning a signature) acts as pre-confirmation,
+   * similar to Base's Flashblocks sequencer commitment.
+   * Best for micropayments where speed > finality guarantees.
+   * Confirmation still runs in background via onConfirmationProgress callback.
+   */
+  skipConfirmation?: boolean;
   /** Optional callback for progressive confirmation updates */
   onConfirmationProgress?: SolanaConfirmationCallback;
 }
@@ -110,6 +118,7 @@ export async function executeSolanaSettlement(
     signedTransaction,
     facilitatorPrivateKey,
     commitmentLevel = 'confirmed',
+    skipConfirmation = false,
     onConfirmationProgress,
   } = params;
 
@@ -250,27 +259,49 @@ export async function executeSolanaSettlement(
       });
     }
 
-    // Wait for transaction confirmation before returning success
-    // Solana's Shreds architecture streams block data in real-time,
-    // providing fast pre-confirmation similar to Base's Flashblocks
+    // === Pre-confirmation mode (skipConfirmation) ===
+    // Return immediately after sendTransaction — the leader accepting the tx
+    // and returning a signature IS the pre-confirmation (like Flashblocks).
+    // Confirmation runs in background via callback.
+    if (skipConfirmation) {
+      console.log(`[SolanaSettlement] FAST MODE: Returning immediately with signature:`, signature);
+
+      // Fire-and-forget: track confirmation in background
+      if (onConfirmationProgress) {
+        onConfirmationProgress({
+          level: 'processed',
+          signature,
+          timestamp: Date.now(),
+        });
+
+        // Background confirmation tracking
+        connection.getLatestBlockhash('confirmed').then(({ blockhash, lastValidBlockHeight }) => {
+          connection.confirmTransaction(
+            { signature, blockhash, lastValidBlockHeight },
+            'confirmed'
+          ).then((confirmation) => {
+            if (!confirmation.value.err) {
+              onConfirmationProgress({
+                level: 'confirmed',
+                signature,
+                timestamp: Date.now(),
+              });
+            }
+          }).catch(() => { /* ignore background confirmation errors */ });
+        }).catch(() => { /* ignore blockhash fetch errors */ });
+      }
+
+      return {
+        success: true,
+        transactionHash: signature,
+        commitmentLevel: 'processed',
+      };
+    }
+
+    // === Standard confirmation mode ===
     console.log(`[SolanaSettlement] Waiting for '${commitmentLevel}' confirmation...`);
     try {
       const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash(commitmentLevel);
-
-      // For progressive confirmation: if target is 'confirmed' or 'finalized',
-      // first check 'processed' level and notify via callback
-      if (onConfirmationProgress && commitmentLevel !== 'processed') {
-        // Fire-and-forget: check processed status in parallel
-        connection.getSignatureStatus(signature).then((status) => {
-          if (status.value?.confirmationStatus) {
-            onConfirmationProgress({
-              level: 'processed',
-              signature,
-              timestamp: Date.now(),
-            });
-          }
-        }).catch(() => { /* ignore progress check errors */ });
-      }
 
       const confirmation = await connection.confirmTransaction(
         {
@@ -302,35 +333,15 @@ export async function executeSolanaSettlement(
         });
       }
 
-      // If target was 'confirmed' and we want to also track finalization in background
-      if (commitmentLevel === 'confirmed' && onConfirmationProgress) {
-        // Fire-and-forget: monitor finalization in background
-        connection.confirmTransaction(
-          { signature, blockhash, lastValidBlockHeight },
-          'finalized'
-        ).then((finalConfirmation) => {
-          if (!finalConfirmation.value.err) {
-            onConfirmationProgress({
-              level: 'finalized',
-              signature,
-              timestamp: Date.now(),
-            });
-          }
-        }).catch(() => { /* ignore background finalization check */ });
-      }
-
       return {
         success: true,
         transactionHash: signature,
         commitmentLevel,
       };
     } catch (confirmError) {
-      // If confirmation times out but tx was sent, still return success
-      // The transaction may still land, just confirmation timed out
+      // If confirmation times out but tx was sent, check if it landed
       console.warn('[SolanaSettlement] Confirmation timeout, but tx was sent:', signature);
-      console.warn('[SolanaSettlement] Error:', confirmError);
 
-      // Check if the transaction landed anyway
       try {
         const status = await connection.getSignatureStatus(signature);
         if (status.value?.confirmationStatus === 'confirmed' || status.value?.confirmationStatus === 'finalized') {
@@ -346,7 +357,6 @@ export async function executeSolanaSettlement(
         // Ignore status check errors
       }
 
-      // Return the error - transaction may or may not have landed
       return {
         success: false,
         transactionHash: signature,
