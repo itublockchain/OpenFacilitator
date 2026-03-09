@@ -401,19 +401,15 @@ export class Facilitator {
           };
         }
 
-        // Dynamic commitment strategy based on payment amount:
-        //   < $1 USDC  (1_000_000):  skipConfirmation — return immediately (~200ms)
-        //   $1-$100     :             confirmed — 66%+ stake voted (~1-2s)
-        //   > $100      :             finalized — fully irreversible (~6-12s)
+        // Commitment strategy based on payment amount:
+        //   < $100 USDC : confirmed — 66%+ stake voted (~1-2s), no historical reverts
+        //   >= $100 USDC: finalized — fully irreversible (~6-12s)
         const paymentAmount = BigInt(getRequiredAmount(requirements));
-        const SKIP_THRESHOLD = BigInt(1_000_000);       // $1 USDC (6 decimals)
         const FINALIZED_THRESHOLD = BigInt(100_000_000); // $100 USDC (6 decimals)
-
-        const shouldSkipConfirmation = paymentAmount < SKIP_THRESHOLD;
         const solanaCommitment: SolanaCommitmentLevel =
           paymentAmount >= FINALIZED_THRESHOLD ? 'finalized' : 'confirmed';
 
-        console.log(`[Facilitator] Solana settlement: amount=${paymentAmount}, commitment=${solanaCommitment}, skip=${shouldSkipConfirmation}`);
+        console.log(`[Facilitator] Solana settlement: amount=${paymentAmount}, commitment=${solanaCommitment}`);
 
         // For Solana, private key is base58 encoded (not hex)
         const result = await executeSolanaSettlement({
@@ -421,7 +417,6 @@ export class Facilitator {
           signedTransaction,
           facilitatorPrivateKey: privateKey,
           commitmentLevel: solanaCommitment,
-          skipConfirmation: shouldSkipConfirmation,
         });
 
         if (result.success) {

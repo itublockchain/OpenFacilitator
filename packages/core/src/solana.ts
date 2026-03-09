@@ -60,17 +60,6 @@ export const USDC_MINTS: Record<string, string> = {
  */
 export type SolanaCommitmentLevel = 'processed' | 'confirmed' | 'finalized';
 
-/**
- * Callback for progressive confirmation updates
- * Allows callers to receive intermediate status updates as the transaction
- * progresses through confirmation levels (processed → confirmed → finalized)
- */
-export type SolanaConfirmationCallback = (update: {
-  level: SolanaCommitmentLevel;
-  signature: string;
-  timestamp: number;
-}) => void;
-
 export interface SolanaSettlementParams {
   network: 'solana' | 'solana-devnet';
   /** Base64 or base58 encoded signed transaction from the payer */
@@ -81,19 +70,8 @@ export interface SolanaSettlementParams {
    * Commitment level to wait for before returning success.
    * Defaults to 'confirmed' (~1-2s, 66%+ stake voted, no historical reverts).
    * Use 'finalized' for large amounts (~6-12s, fully irreversible).
-   * Use 'processed' for ultra-fast pre-confirmation (~400ms, fork risk).
    */
   commitmentLevel?: SolanaCommitmentLevel;
-  /**
-   * Skip confirmation entirely and return immediately after sendTransaction.
-   * The leader accepting the tx (returning a signature) acts as pre-confirmation,
-   * similar to Base's Flashblocks sequencer commitment.
-   * Best for micropayments where speed > finality guarantees.
-   * Confirmation still runs in background via onConfirmationProgress callback.
-   */
-  skipConfirmation?: boolean;
-  /** Optional callback for progressive confirmation updates */
-  onConfirmationProgress?: SolanaConfirmationCallback;
 }
 
 export interface SolanaSettlementResult {
@@ -118,8 +96,6 @@ export async function executeSolanaSettlement(
     signedTransaction,
     facilitatorPrivateKey,
     commitmentLevel = 'confirmed',
-    skipConfirmation = false,
-    onConfirmationProgress,
   } = params;
 
   console.log('[SolanaSettlement] Starting settlement:', {
@@ -259,46 +235,6 @@ export async function executeSolanaSettlement(
       });
     }
 
-    // === Pre-confirmation mode (skipConfirmation) ===
-    // Return immediately after sendTransaction — the leader accepting the tx
-    // and returning a signature IS the pre-confirmation (like Flashblocks).
-    // Confirmation runs in background via callback.
-    if (skipConfirmation) {
-      console.log(`[SolanaSettlement] FAST MODE: Returning immediately with signature:`, signature);
-
-      // Fire-and-forget: track confirmation in background
-      if (onConfirmationProgress) {
-        onConfirmationProgress({
-          level: 'processed',
-          signature,
-          timestamp: Date.now(),
-        });
-
-        // Background confirmation tracking
-        connection.getLatestBlockhash('confirmed').then(({ blockhash, lastValidBlockHeight }) => {
-          connection.confirmTransaction(
-            { signature, blockhash, lastValidBlockHeight },
-            'confirmed'
-          ).then((confirmation) => {
-            if (!confirmation.value.err) {
-              onConfirmationProgress({
-                level: 'confirmed',
-                signature,
-                timestamp: Date.now(),
-              });
-            }
-          }).catch(() => { /* ignore background confirmation errors */ });
-        }).catch(() => { /* ignore blockhash fetch errors */ });
-      }
-
-      return {
-        success: true,
-        transactionHash: signature,
-        commitmentLevel: 'processed',
-      };
-    }
-
-    // === Standard confirmation mode ===
     console.log(`[SolanaSettlement] Waiting for '${commitmentLevel}' confirmation...`);
     try {
       const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash(commitmentLevel);
@@ -323,15 +259,6 @@ export async function executeSolanaSettlement(
       }
 
       console.log(`[SolanaSettlement] SUCCESS! Transaction ${commitmentLevel}:`, signature);
-
-      // Notify callback of the achieved confirmation level
-      if (onConfirmationProgress) {
-        onConfirmationProgress({
-          level: commitmentLevel,
-          signature,
-          timestamp: Date.now(),
-        });
-      }
 
       return {
         success: true,
